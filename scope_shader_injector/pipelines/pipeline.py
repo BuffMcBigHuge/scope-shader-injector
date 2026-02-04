@@ -1,5 +1,7 @@
 """Shader Injector pipeline implementation."""
 
+import logging
+import sys
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -15,6 +17,53 @@ from .schema import DEFAULT_SHADER, ShaderInjectorConfig
 
 if TYPE_CHECKING:
     from scope.core.pipelines.base_schema import BasePipelineConfig
+
+logger = logging.getLogger(__name__)
+
+
+def create_headless_context() -> moderngl.Context:
+    """Create a ModernGL context that works in headless environments.
+
+    Tries multiple backends in order of preference:
+    1. EGL (works headless on Linux with proper drivers)
+    2. Default standalone (works on macOS, Windows, Linux with display)
+
+    Returns:
+        ModernGL context.
+
+    Raises:
+        RuntimeError: If no suitable backend is available.
+    """
+    errors = []
+
+    # On Linux, try EGL first for headless support
+    if sys.platform.startswith('linux'):
+        try:
+            # Try EGL backend (headless-compatible)
+            # Use create_context with standalone=True and backend='egl'
+            ctx = moderngl.create_context(standalone=True, backend='egl')
+            logger.info("Created ModernGL context using EGL backend")
+            return ctx
+        except Exception as e:
+            errors.append(f"EGL: {e}")
+            logger.debug(f"EGL backend failed: {e}")
+
+    # Try default standalone context
+    # On macOS this uses CGL, on Windows uses WGL
+    try:
+        ctx = moderngl.create_context(standalone=True)
+        logger.info("Created ModernGL context using default backend")
+        return ctx
+    except Exception as e:
+        errors.append(f"Default: {e}")
+        logger.debug(f"Default backend failed: {e}")
+
+    # All backends failed
+    raise RuntimeError(
+        f"Failed to create OpenGL context. Tried backends: {'; '.join(errors)}. "
+        "For headless Linux, ensure you have EGL support installed "
+        "(e.g., libegl1-mesa-dev, or NVIDIA EGL libraries)."
+    )
 
 
 # Vertex shader for fullscreen quad
@@ -83,8 +132,8 @@ class ShaderInjectorPipeline(Pipeline):
         self.height = height
         self.width = width
 
-        # Create standalone OpenGL context (headless)
-        self.ctx = moderngl.create_standalone_context()
+        # Create standalone OpenGL context (headless-compatible)
+        self.ctx = create_headless_context()
 
         # Create fullscreen quad geometry
         vertices = np.array([

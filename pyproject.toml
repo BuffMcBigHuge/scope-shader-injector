@@ -8,6 +8,7 @@ license = { text = "MIT" }
 keywords = ["scope", "shader", "glsl", "video", "shadertoy"]
 dependencies = [
     "moderngl>=5.10.0",
+    "glcontext>=3.0.0",  # Provides EGL backend for headless rendering
     "numpy>=1.26.0",
     "pillow>=10.0.0",
 ]

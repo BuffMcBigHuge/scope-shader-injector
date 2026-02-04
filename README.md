@@ -133,9 +133,31 @@ The `examples/` directory contains ready-to-use shaders:
 - Python 3.12+
 - OpenGL 3.3+ capable GPU
 
+### Headless Linux Setup
+
+For running on a headless Linux server (no display), you need EGL support:
+
+**Ubuntu/Debian:**
+```bash
+# For Mesa (AMD/Intel/software rendering)
+sudo apt install libegl1-mesa-dev libgl1-mesa-dri
+
+# For NVIDIA GPUs
+sudo apt install libnvidia-egl-wayland1
+# Or ensure nvidia-driver includes EGL support
+```
+
+**With NVIDIA Container Toolkit (Docker):**
+```bash
+docker run --gpus all -e NVIDIA_DRIVER_CAPABILITIES=all ...
+```
+
+The plugin automatically tries EGL backend on Linux for headless operation.
+
 ## Dependencies
 
 - moderngl - OpenGL shader compilation and rendering
+- glcontext - EGL/GLX backend support for headless rendering  
 - numpy - Array operations
 - pillow - Image loading
 - torch - Tensor operations (provided by Scope)
