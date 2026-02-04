@@ -13,6 +13,9 @@ dependencies = [
     "pillow>=10.0.0",
 ]
 
+[project.scripts]
+shader-injector-check = "scope_shader_injector.setup_dependencies:print_status"
+
 [project.entry-points."scope"]
 scope_shader_injector = "scope_shader_injector.plugin"
 

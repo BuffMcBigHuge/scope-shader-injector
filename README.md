@@ -131,28 +131,117 @@ The `examples/` directory contains ready-to-use shaders:
 
 - Scope (with plugin support)
 - Python 3.12+
-- OpenGL 3.3+ capable GPU
+- OpenGL 3.3+ capable GPU (or software rendering)
 
-### Headless Linux Setup
+## Checking Dependencies
 
-For running on a headless Linux server (no display), you need EGL support:
+The plugin includes a built-in dependency checker. Run it to verify your system is properly configured:
 
-**Ubuntu/Debian:**
 ```bash
-# For Mesa (AMD/Intel/software rendering)
-sudo apt install libegl1-mesa-dev libgl1-mesa-dri
+# After installing the plugin, run:
+python -m scope_shader_injector
 
-# For NVIDIA GPUs
-sudo apt install libnvidia-egl-wayland1
-# Or ensure nvidia-driver includes EGL support
+# Or use the command-line tool:
+shader-injector-check
 ```
 
-**With NVIDIA Container Toolkit (Docker):**
-```bash
-docker run --gpus all -e NVIDIA_DRIVER_CAPABILITIES=all ...
+This will show:
+- Platform detection
+- Available display (X11/Wayland)
+- EGL/GL library availability
+- Whether context creation succeeds
+
+Example output:
+```
+============================================================
+Scope Shader Injector - OpenGL Dependency Check
+============================================================
+
+Platform: linux
+Display available: False
+EGL library: libEGL.so.1
+GL library: libGL.so.1
+Context creation: EGL
+
+✓ OpenGL context creation successful!
+  The Shader Injector plugin should work correctly.
+
+============================================================
 ```
 
-The plugin automatically tries EGL backend on Linux for headless operation.
+## Headless Linux Setup
+
+For running on a headless Linux server (no display), you need EGL support.
+
+**Ubuntu 24.04+ (Noble):**
+```bash
+sudo apt-get update
+sudo apt-get install -y libegl1 libegl-dev libgl1 libgl-dev
+```
+
+**Ubuntu 22.04 and earlier / Debian:**
+```bash
+sudo apt-get update
+sudo apt-get install -y libegl1-mesa libegl1-mesa-dev libgl1-mesa-glx libgl1-mesa-dev
+```
+
+**Fedora/RHEL/CentOS:**
+```bash
+sudo dnf install -y mesa-libEGL mesa-libEGL-devel mesa-libGL mesa-libGL-devel
+```
+
+**Arch Linux:**
+```bash
+sudo pacman -S mesa
+```
+
+**NVIDIA GPUs:**
+```bash
+# The NVIDIA driver should include EGL support
+# Verify driver is working:
+nvidia-smi
+
+# If EGL is missing, it may be provided by:
+sudo apt-get install -y libnvidia-gl-550  # Replace 550 with your driver version
+```
+
+**Docker with NVIDIA GPU:**
+```bash
+# Run container with GPU access and graphics capabilities
+docker run --gpus all \
+  -e NVIDIA_DRIVER_CAPABILITIES=graphics,compute,utility \
+  your-image
+
+# Or use an NVIDIA base image with OpenGL support:
+# FROM nvidia/opengl:1.2-glvnd-runtime-ubuntu22.04
+```
+
+**Docker without GPU (Software Rendering):**
+```bash
+# Add to Dockerfile:
+RUN apt-get update && apt-get install -y \
+    libegl1 libgl1 libosmesa6 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set environment variable for software rendering:
+ENV LIBGL_ALWAYS_SOFTWARE=1
+```
+
+**Verify EGL Installation:**
+```bash
+# Check if EGL libraries are installed:
+find /usr -name "libEGL*" 2>/dev/null
+
+# Expected output:
+# /usr/lib/x86_64-linux-gnu/libEGL.so.1
+# /usr/lib/x86_64-linux-gnu/libEGL.so
+```
+
+The plugin automatically detects and uses the best available backend:
+1. **EGL** (preferred for headless Linux with GPU)
+2. **X11/GLX** (Linux with display)
+3. **CGL** (macOS)
+4. **WGL** (Windows)
 
 ## Dependencies
 
@@ -170,6 +259,13 @@ To modify the plugin during development:
 2. Make code changes
 3. Click the Reload button in Settings → Plugins
 4. The server will restart with your changes
+
+### Running the Dependency Check During Development
+
+```bash
+cd /path/to/scope-shader-injector
+python -m scope_shader_injector
+```
 
 ## License
 
