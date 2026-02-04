@@ -3,6 +3,7 @@
 import logging
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -388,27 +389,23 @@ class ShaderInjectorPipeline(Pipeline):
         self.width = width
         
         logger.info(f"Initializing ShaderInjectorPipeline: {width}x{height}")
-
-        # Create standalone OpenGL context (headless-compatible)
-        self.ctx = create_headless_context()
+        logger.info(f"Init thread ID: {threading.get_ident()} (OpenGL will be initialized lazily)")
         
-        # Log context info
-        logger.info(f"OpenGL Version: {self.ctx.version_code}")
-        logger.info(f"OpenGL Vendor: {self.ctx.info.get('GL_VENDOR', 'Unknown')}")
-        logger.info(f"OpenGL Renderer: {self.ctx.info.get('GL_RENDERER', 'Unknown')}")
-
-        # Create fullscreen quad geometry
-        vertices = np.array([
-            # position    texcoord
-            -1.0, -1.0,   0.0, 0.0,
-            1.0, -1.0,    1.0, 0.0,
-            -1.0, 1.0,    0.0, 1.0,
-            1.0, 1.0,     1.0, 1.0,
-        ], dtype='f4')
-
-        self.vbo = self.ctx.buffer(vertices)
-
-        # Initialize state
+        # Store configuration from kwargs (passed at pipeline load time)
+        self.initial_shader_code = kwargs.get("shader_code", DEFAULT_SHADER)
+        self.initial_reference_image = kwargs.get("reference_image", "")
+        self.initial_time_scale = kwargs.get("time_scale", 1.0)
+        self.initial_param1 = kwargs.get("param1", 0.5)
+        self.initial_param2 = kwargs.get("param2", 0.5)
+        self.initial_param3 = kwargs.get("param3", 0.5)
+        
+        logger.info(f"Initial shader code length: {len(self.initial_shader_code)} chars")
+        
+        # OpenGL resources - will be initialized lazily in the worker thread
+        self._gl_initialized = False
+        self._gl_thread_id = None
+        self.ctx = None
+        self.vbo = None
         self.program = None
         self.vao = None
         self.current_shader_code = None
@@ -427,14 +424,245 @@ class ShaderInjectorPipeline(Pipeline):
         self.start_time = time.time()
         self.last_frame_time = self.start_time
 
-        # Compile default shader
-        self._compile_shader(DEFAULT_SHADER)
+    def _initialize_gl(self):
+        """Initialize OpenGL resources. Called lazily from the worker thread."""
+        if self._gl_initialized:
+            return
+        
+        current_thread = threading.get_ident()
+        logger.info(f"Initializing OpenGL in worker thread: {current_thread}")
+        
+        # Create standalone OpenGL context (headless-compatible)
+        self.ctx = create_headless_context()
+        self._gl_thread_id = current_thread
+        
+        # Log context info
+        logger.info(f"OpenGL Version: {self.ctx.version_code}")
+        logger.info(f"OpenGL Vendor: {self.ctx.info.get('GL_VENDOR', 'Unknown')}")
+        logger.info(f"OpenGL Renderer: {self.ctx.info.get('GL_RENDERER', 'Unknown')}")
+        logger.info(f"Max Texture Size: {self.ctx.info.get('GL_MAX_TEXTURE_SIZE', 'Unknown')}")
+        
+        # Test basic texture creation to verify context is working
+        try:
+            test_data = np.zeros((16, 16, 4), dtype=np.uint8)
+            test_texture = self.ctx.texture((16, 16), 4, test_data.tobytes())
+            test_texture.release()
+            logger.info("OpenGL context texture test passed")
+        except Exception as e:
+            logger.error(f"OpenGL context texture test FAILED: {e}")
+            raise RuntimeError(f"OpenGL context is not functional: {e}")
+
+        # Create fullscreen quad geometry
+        vertices = np.array([
+            # position    texcoord
+            -1.0, -1.0,   0.0, 0.0,
+            1.0, -1.0,    1.0, 0.0,
+            -1.0, 1.0,    0.0, 1.0,
+            1.0, 1.0,     1.0, 1.0,
+        ], dtype='f4')
+
+        self.vbo = self.ctx.buffer(vertices)
+
+        # Mark as initialized BEFORE calling methods that might check this
+        self._gl_initialized = True
+        
+        # Compile the initial shader (from config, not default)
+        logger.info(f"Compiling initial shader ({len(self.initial_shader_code)} chars)")
+        self._compile_shader(self.initial_shader_code)
         self._setup_framebuffer()
+        
+        logger.info("OpenGL initialization complete")
 
     @classmethod
     def get_config_class(cls) -> type["BasePipelineConfig"]:
         """Return the configuration class for this pipeline."""
         return ShaderInjectorConfig
+
+    def _preprocess_shader_code(self, shader_code: str) -> str:
+        """Preprocess shader code to handle flattened single-line input.
+        
+        When shader code is passed through certain interfaces, newlines may be
+        removed, causing // comments to comment out the entire shader.
+        This function attempts to restore proper line breaks.
+        
+        Args:
+            shader_code: Raw shader code, possibly flattened to single line.
+            
+        Returns:
+            Shader code with proper line breaks restored.
+        """
+        import re
+        
+        # Step 0: Sanitize input - remove characters that GLSL doesn't support
+        # This handles JSON escaping artifacts and copy-paste issues
+        
+        # Remove any quote characters (GLSL doesn't support strings)
+        if '"' in shader_code or "'" in shader_code:
+            logger.warning("Removing quote characters from shader code (GLSL doesn't support strings)")
+            shader_code = shader_code.replace('"', '').replace("'", '')
+        
+        # Remove common JSON escape sequences that might have leaked through
+        shader_code = shader_code.replace('\\n', '\n')  # Convert literal \n to newline
+        shader_code = shader_code.replace('\\t', ' ')   # Convert literal \t to space
+        shader_code = shader_code.replace('\\/', '/')   # Unescape forward slash
+        
+        # If the code already has proper newlines, return as-is
+        if shader_code.count('\n') > 3:
+            return shader_code
+        
+        # If no mainImage, nothing to do
+        if 'mainImage' not in shader_code:
+            return shader_code
+        
+        logger.info(f"Preprocessing shader code ({len(shader_code)} chars, {shader_code.count(chr(10))} newlines)")
+        
+        # Step 1: Extract everything before 'void mainImage' as comments
+        # and everything from 'void mainImage' onwards as the actual code
+        main_idx = shader_code.find('void mainImage')
+        
+        # Also check for truncated input like 'mainImage(' without 'void'
+        if main_idx == -1:
+            main_idx = shader_code.find('mainImage(')
+            if main_idx != -1:
+                # Insert 'void ' before mainImage
+                shader_code = shader_code[:main_idx] + 'void ' + shader_code[main_idx:]
+                main_idx = shader_code.find('void mainImage')
+                logger.warning("Shader was missing 'void' before mainImage, auto-fixed")
+        
+        # Check for even more truncated input 'Image(' at the start
+        if main_idx == -1:
+            if shader_code.strip().startswith('Image('):
+                shader_code = 'void main' + shader_code.strip()
+                main_idx = 0
+                logger.warning("Shader was truncated to 'Image(', auto-fixed to 'void mainImage('")
+        
+        if main_idx == -1:
+            logger.warning("Could not find mainImage function in shader code")
+            return shader_code
+        
+        # Everything before mainImage - could be comments AND helper functions
+        before_main = shader_code[:main_idx].strip()
+        code_part = shader_code[main_idx:]
+        
+        # Separate comments from helper functions in the before_main part
+        # Helper functions contain patterns like "float funcname(" or "vec3 funcname("
+        comments_part = ""
+        helper_functions_part = ""
+        
+        if before_main:
+            # Find where actual code (helper functions) starts
+            # Look for function definitions: type name(
+            func_match = re.search(r'(float|int|vec[234]|mat[234]|void|bool)\s+[a-zA-Z_][a-zA-Z0-9_]*\s*\(', before_main)
+            
+            if func_match:
+                # There are helper functions - split comments from functions
+                func_start = func_match.start()
+                comments_part = before_main[:func_start].strip()
+                helper_functions_part = before_main[func_start:]
+                logger.info(f"Found helper functions before mainImage: {helper_functions_part[:60]}...")
+            else:
+                # No helper functions, everything is comments
+                comments_part = before_main
+        
+        # Step 2: Format the code part properly
+        # Replace multiple spaces with single space first
+        code_part = re.sub(r'  +', ' ', code_part)
+        
+        # Add newlines at key positions
+        # After opening brace
+        code_part = re.sub(r'\{\s*', '{\n    ', code_part)
+        # Before closing brace
+        code_part = re.sub(r'\s*\}', '\n}', code_part)
+        # After semicolons followed by code OR comments
+        code_part = re.sub(r';\s*(?=[a-zA-Z/])', ';\n    ', code_part)
+        
+        # Step 3: Handle any // comments within the code
+        # They need to end at the next statement
+        lines = code_part.split('\n')
+        fixed_lines = []
+        for line in lines:
+            line = line.strip()
+            if '//' in line:
+                # Find if there's code after the comment
+                comment_idx = line.find('//')
+                before_comment = line[:comment_idx].strip()
+                after_comment = line[comment_idx:]
+                
+                # Check if the comment has code after it (after the comment text)
+                # Pattern: // some text followed by a type keyword starting a statement
+                # Match common GLSL types (must be followed by identifier or opening paren)
+                # Note: Use .*? instead of [^/]*? because comments may contain / (e.g., "barrel/pincushion")
+                match = re.search(
+                    r'//.*?\s+(void\s+\w|vec[234]\s+\w|mat[234]\s+\w|float\s+\w|int\s+\w|bool\s+\w|fragColor\s*=|return\s)', 
+                    after_comment
+                )
+                # Control flow must be followed by (
+                if not match:
+                    match = re.search(r'//.*?\s+(if\s*\(|for\s*\(|while\s*\()', after_comment)
+                # Variable assignments (only if no type keyword found)
+                if not match:
+                    match = re.search(r'//.*?\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*[^=]', after_comment)
+                
+                if match:
+                    # Split the comment from the code
+                    split_pos = match.start(1)
+                    comment_text = after_comment[:split_pos].rstrip()
+                    code_after = after_comment[split_pos:]
+                    if before_comment:
+                        fixed_lines.append(before_comment)
+                    fixed_lines.append(comment_text)
+                    fixed_lines.append('    ' + code_after)
+                else:
+                    fixed_lines.append(line)
+            else:
+                if line:
+                    fixed_lines.append(line)
+        
+        # Step 4: Combine comments, helper functions, and formatted main code
+        result_lines = []
+        
+        # Add comments first
+        if comments_part:
+            # Split comments by // to put each on its own line
+            comment_parts = comments_part.split('//')
+            for i, part in enumerate(comment_parts):
+                part = part.strip()
+                if part:
+                    if i > 0:
+                        result_lines.append('// ' + part)
+                    else:
+                        # First part might not have // prefix if it's leading text
+                        if comment_parts[0].strip():
+                            result_lines.append(part)
+        
+        # Add helper functions (need formatting too)
+        if helper_functions_part:
+            # Format helper functions similar to main code
+            helpers = helper_functions_part
+            helpers = re.sub(r'  +', ' ', helpers)
+            helpers = re.sub(r'\{\s*', '{\n    ', helpers)
+            helpers = re.sub(r'\s*\}', '\n}', helpers)
+            helpers = re.sub(r';\s*(?=[a-zA-Z/])', ';\n    ', helpers)
+            
+            # Split into lines and clean up
+            for line in helpers.split('\n'):
+                line = line.strip()
+                if line:
+                    result_lines.append(line)
+            
+            # Add blank line before mainImage
+            result_lines.append('')
+        
+        # Add the main function code
+        result_lines.extend(fixed_lines)
+        
+        result = '\n'.join(result_lines)
+        
+        # Clean up any double newlines
+        result = re.sub(r'\n\s*\n', '\n', result)
+        
+        logger.info(f"Preprocessed shader:\n{result}")
+        return result
 
     def _compile_shader(self, shader_code: str) -> bool:
         """Compile a Shadertoy-style shader.
@@ -448,39 +676,102 @@ class ShaderInjectorPipeline(Pipeline):
         if shader_code == self.current_shader_code and self.program is not None:
             return True
 
-        # Build full fragment shader
-        fragment_shader = FRAGMENT_SHADER_TEMPLATE.format(user_code=shader_code)
+        # Preprocess shader code to handle flattened input
+        shader_code = self._preprocess_shader_code(shader_code)
 
-        try:
-            # Clean up old program
-            if self.program is not None:
-                self.program.release()
-                self.program = None
-            if self.vao is not None:
-                self.vao.release()
-                self.vao = None
-
-            # Compile new program
-            self.program = self.ctx.program(
-                vertex_shader=VERTEX_SHADER,
-                fragment_shader=fragment_shader,
-            )
-
-            # Create VAO
-            self.vao = self.ctx.vertex_array(
-                self.program,
-                [(self.vbo, '2f 2f', 'in_position', 'in_texcoord')],
-            )
-
-            self.current_shader_code = shader_code
-            return True
-
-        except Exception as e:
-            print(f"Shader compilation error: {e}")
-            # Revert to default shader if compilation fails
+        # Validate shader code contains mainImage function
+        if "mainImage" not in shader_code:
+            logger.warning("Shader code missing 'mainImage' function, using default shader")
             if shader_code != DEFAULT_SHADER:
                 return self._compile_shader(DEFAULT_SHADER)
             return False
+
+        # Build full fragment shader
+        fragment_shader = FRAGMENT_SHADER_TEMPLATE.format(user_code=shader_code)
+        
+        # Log the shader being compiled for debugging
+        logger.debug(f"Compiling fragment shader:\n{fragment_shader[:500]}...")
+
+        # Store old program/vao in case we need to restore
+        old_program = self.program
+        old_vao = self.vao
+        old_shader_code = self.current_shader_code
+
+        try:
+            # Compile new program
+            logger.info("Compiling shader program...")
+            new_program = self.ctx.program(
+                vertex_shader=VERTEX_SHADER,
+                fragment_shader=fragment_shader,
+            )
+            logger.info("Shader program compiled successfully")
+
+            # Create VAO - always use skip_errors=True to handle optimized-out attributes
+            # Per ModernGL docs, attributes not used in shader may be optimized out
+            new_vao = self.ctx.vertex_array(
+                new_program,
+                [(self.vbo, '2f 2f', 'in_position', 'in_texcoord')],
+                skip_errors=True,
+            )
+
+            # Success - clean up old resources and use new ones
+            if old_program is not None:
+                old_program.release()
+            if old_vao is not None:
+                old_vao.release()
+
+            self.program = new_program
+            self.vao = new_vao
+            self.current_shader_code = shader_code
+            logger.info(f"Shader compiled successfully: {shader_code[:80]}...")
+            return True
+
+        except Exception as e:
+            logger.error(f"Shader compilation error: {e}")
+            
+            # Keep the old working program if we have one
+            if old_program is not None:
+                logger.info("Keeping previous working shader")
+                self.program = old_program
+                self.vao = old_vao
+                self.current_shader_code = old_shader_code
+                return False
+            
+            # No previous shader, try default
+            if shader_code != DEFAULT_SHADER:
+                logger.info("Falling back to default shader")
+                return self._compile_shader(DEFAULT_SHADER)
+            
+            # Even default shader failed - this is a serious error
+            logger.error("Default shader compilation failed - OpenGL context may be broken")
+            return False
+
+    def _ensure_context_active(self):
+        """Ensure the OpenGL context is active/current.
+        
+        For standalone contexts, this makes the context current for the calling thread.
+        This also initializes OpenGL if not yet done (lazy initialization).
+        """
+        # Initialize OpenGL if not yet done
+        if not self._gl_initialized:
+            self._initialize_gl()
+            return  # Context is already current after initialization
+        
+        # Check if we're in the same thread
+        current_thread = threading.get_ident()
+        if self._gl_thread_id and current_thread != self._gl_thread_id:
+            logger.error(f"OpenGL context used from wrong thread! GL thread: {self._gl_thread_id}, Current: {current_thread}")
+            raise RuntimeError("OpenGL context cannot be used from a different thread")
+        
+        try:
+            # For standalone contexts, we need to make sure it's current
+            if hasattr(self.ctx, 'mglo') and hasattr(self.ctx.mglo, 'make_current'):
+                self.ctx.mglo.make_current()
+            else:
+                self.ctx.__enter__()
+        except Exception as e:
+            logger.debug(f"Context activation: {e}")
+            # Context might already be current, which is fine
 
     def _setup_framebuffer(self):
         """Set up the output framebuffer."""
@@ -490,6 +781,9 @@ class ShaderInjectorPipeline(Pipeline):
             self.fbo.release()
 
         logger.info(f"Setting up framebuffer: {self.width}x{self.height}")
+        
+        # Ensure context is active
+        self._ensure_context_active()
         
         try:
             self.output_texture = self.ctx.texture((self.width, self.height), 4)
@@ -518,6 +812,9 @@ class ShaderInjectorPipeline(Pipeline):
         Returns:
             ModernGL texture.
         """
+        # Ensure context is active before GPU operations
+        self._ensure_context_active()
+        
         # Handle different tensor shapes
         if tensor.dim() == 4:
             tensor = tensor.squeeze(0)
@@ -619,22 +916,30 @@ class ShaderInjectorPipeline(Pipeline):
             return None
 
         try:
+            # Ensure context is active
+            self._ensure_context_active()
+            
             img = Image.open(path).convert('RGBA')
             img = img.resize((self.width, self.height), Image.Resampling.LANCZOS)
             data = np.array(img, dtype=np.uint8)
+            data = np.ascontiguousarray(data)
 
             texture = self.ctx.texture((self.width, self.height), 4, data.tobytes())
             texture.filter = (moderngl.LINEAR, moderngl.LINEAR)
             return texture
 
         except Exception as e:
-            print(f"Failed to load reference image: {e}")
+            logger.error(f"Failed to load reference image: {e}")
             return None
 
     def _create_black_texture(self) -> moderngl.Texture:
         """Create a black texture for unused channels."""
+        # Ensure context is active
+        self._ensure_context_active()
+        
         data = np.zeros((self.height, self.width, 4), dtype=np.uint8)
         data[:, :, 3] = 255  # Full alpha
+        data = np.ascontiguousarray(data)
 
         texture = self.ctx.texture((self.width, self.height), 4, data.tobytes())
         texture.filter = (moderngl.LINEAR, moderngl.LINEAR)
@@ -642,6 +947,9 @@ class ShaderInjectorPipeline(Pipeline):
 
     def _create_test_pattern(self) -> moderngl.Texture:
         """Create a test pattern texture for text mode (no video input)."""
+        # Ensure context is active
+        self._ensure_context_active()
+        
         # Create a colorful gradient pattern
         y, x = np.mgrid[0:self.height, 0:self.width]
         r = ((x / self.width) * 255).astype(np.uint8)
@@ -650,6 +958,8 @@ class ShaderInjectorPipeline(Pipeline):
         a = np.full((self.height, self.width), 255, dtype=np.uint8)
 
         data = np.stack([r, g, b, a], axis=-1)
+        data = np.ascontiguousarray(data)
+        
         texture = self.ctx.texture((self.width, self.height), 4, data.tobytes())
         texture.filter = (moderngl.LINEAR, moderngl.LINEAR)
         return texture
@@ -685,24 +995,49 @@ class ShaderInjectorPipeline(Pipeline):
         Returns:
             Dict with "video" key containing processed frames tensor.
         """
-        # Get shader code from kwargs or prompt
-        shader_code = kwargs.get("shader_code", kwargs.get("prompt", DEFAULT_SHADER))
-        if not shader_code or shader_code.strip() == "":
-            shader_code = DEFAULT_SHADER
+        # Ensure OpenGL context is active for this thread
+        self._ensure_context_active()
+        
+        # Get shader code - prefer runtime kwargs, fall back to initial config
+        shader_code = kwargs.get("shader_code", kwargs.get("prompt", None))
+        
+        # If no runtime shader code provided, use the initial configuration
+        if shader_code is None or shader_code.strip() == "":
+            shader_code = self.initial_shader_code
+        
+        # Validate shader code - if clearly not GLSL, use initial shader
+        if "mainImage" not in shader_code:
+            # Check if it looks like natural language (no GLSL keywords)
+            glsl_indicators = ["void", "vec", "float", "int", "uniform", "texture", "fragColor"]
+            if not any(indicator in shader_code for indicator in glsl_indicators):
+                logger.debug("Input doesn't appear to be GLSL code, using initial shader")
+                shader_code = self.initial_shader_code
+            else:
+                logger.warning("Shader code missing 'mainImage' function, using initial shader")
+                shader_code = self.initial_shader_code
 
         # Compile shader if changed
-        self._compile_shader(shader_code)
+        compile_success = self._compile_shader(shader_code)
+        
+        # Ensure we have a working program - critical for rendering
+        if self.program is None:
+            logger.error("No working shader program available")
+            if not compile_success:
+                # Last resort - try default shader one more time
+                self._compile_shader(DEFAULT_SHADER)
+            if self.program is None:
+                raise RuntimeError("Failed to compile any shader - cannot render")
 
-        # Get parameters
-        time_scale = kwargs.get("time_scale", 1.0)
+        # Get parameters - prefer runtime kwargs, fall back to initial config
+        time_scale = kwargs.get("time_scale", self.initial_time_scale)
         mouse_x = kwargs.get("mouse_x", 0.5)
         mouse_y = kwargs.get("mouse_y", 0.5)
-        param1 = kwargs.get("param1", 0.5)
-        param2 = kwargs.get("param2", 0.5)
-        param3 = kwargs.get("param3", 0.5)
+        param1 = kwargs.get("param1", self.initial_param1)
+        param2 = kwargs.get("param2", self.initial_param2)
+        param3 = kwargs.get("param3", self.initial_param3)
 
-        # Handle reference image
-        reference_image = kwargs.get("reference_image", "")
+        # Handle reference image - prefer runtime, fall back to initial
+        reference_image = kwargs.get("reference_image", self.initial_reference_image)
         if reference_image != self.reference_image_path:
             if self.reference_texture is not None:
                 self.reference_texture.release()
@@ -806,6 +1141,8 @@ class ShaderInjectorPipeline(Pipeline):
 
         if self.vao is not None:
             self.vao.render(moderngl.TRIANGLE_STRIP)
+        else:
+            logger.error("VAO is None - cannot render!")
 
         # Read back result
         data = self.fbo.read(components=4)
@@ -819,6 +1156,14 @@ class ShaderInjectorPipeline(Pipeline):
 
         # Convert to tensor with shape (1, H, W, 3)
         output = torch.from_numpy(result_rgb).unsqueeze(0)
+
+        # Log every 100 frames to show we're processing
+        if self.frame_count % 100 == 0:
+            # Sample center pixel to verify rendering
+            center_y, center_x = self.height // 2, self.width // 2
+            center_pixel = result_rgb[center_y, center_x]
+            logger.info(f"Frame {self.frame_count}: output shape={output.shape}, "
+                       f"center_pixel={center_pixel}, shader={self.current_shader_code[:50] if self.current_shader_code else 'None'}...")
 
         # Cleanup temporary textures
         input_texture.release()
