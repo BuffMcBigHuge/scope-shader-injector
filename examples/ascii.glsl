@@ -60,18 +60,18 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord)
     brightness = clamp(brightness, 0.0, 1.0);
     
     // Get character pattern
-    float char = asciiChar(charUV, brightness);
+    float charPattern = asciiChar(charUV, brightness);
     
     // Color mode
     vec3 color;
     if (iParam3 < 0.5) {
         // Green monochrome terminal look
-        color = vec3(0.0, char * brightness, 0.0);
+        color = vec3(0.0, charPattern * brightness, 0.0);
         // Add subtle glow
-        color += vec3(0.0, 0.1, 0.05) * char;
+        color += vec3(0.0, 0.1, 0.05) * charPattern;
     } else {
         // Colored ASCII
-        color = video.rgb * char;
+        color = video.rgb * charPattern;
     }
     
     // Dark background
