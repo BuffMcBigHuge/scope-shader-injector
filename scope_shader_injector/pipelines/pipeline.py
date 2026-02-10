@@ -22,48 +22,23 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# GPU Optimization: Try to import CUDA-GL interop libraries
-# These enable zero-copy transfers between CUDA and OpenGL
-_CUDA_GL_AVAILABLE = False
-_cuda_gl_error = None
-
-try:
-    # Try cupy first (more common, easier to install)
-    import cupy as cp
-    from cupy.cuda import runtime as cuda_runtime
-    _CUDA_GL_AVAILABLE = True
-    _CUDA_GL_BACKEND = "cupy"
-    logger.info("CUDA-GL interop available via CuPy")
-except ImportError as e:
-    _cuda_gl_error = str(e)
-    try:
-        # Fall back to pycuda
-        import pycuda.driver as cuda_driver
-        import pycuda.gl as cuda_gl
-        _CUDA_GL_AVAILABLE = True
-        _CUDA_GL_BACKEND = "pycuda"
-        logger.info("CUDA-GL interop available via PyCUDA")
-    except ImportError as e2:
-        _cuda_gl_error = f"cupy: {_cuda_gl_error}, pycuda: {e2}"
-        logger.debug(f"CUDA-GL interop not available: {_cuda_gl_error}")
-
 
 def _find_library_path(name: str) -> str | None:
     """Find the full path to a library.
-    
+
     Args:
         name: Library name (e.g., 'EGL', 'GL')
-        
+
     Returns:
         Full library path or None if not found.
     """
     import ctypes.util
-    
+
     # Try standard find_library first
     lib = ctypes.util.find_library(name)
     if lib:
         return lib
-    
+
     # Try common paths manually
     common_paths = [
         f'/usr/lib/x86_64-linux-gnu/lib{name}.so.1',
@@ -76,23 +51,23 @@ def _find_library_path(name: str) -> str | None:
         f'/usr/lib/x86_64-linux-gnu/nvidia/current/lib{name}.so.1',
         f'/usr/lib64/nvidia/lib{name}.so.1',
     ]
-    
+
     for path in common_paths:
         if os.path.exists(path):
             return path
-    
+
     return None
 
 
 def _check_egl_available() -> tuple[bool, str | None]:
     """Check if EGL libraries are available on the system.
-    
+
     Returns:
         Tuple of (available, library_path)
     """
     if not sys.platform.startswith('linux'):
         return False, None
-    
+
     try:
         lib_path = _find_library_path('EGL')
         return lib_path is not None, lib_path
@@ -102,13 +77,13 @@ def _check_egl_available() -> tuple[bool, str | None]:
 
 def _check_gl_available() -> tuple[bool, str | None]:
     """Check if GL libraries are available on the system.
-    
+
     Returns:
         Tuple of (available, library_path)
     """
     if not sys.platform.startswith('linux'):
         return False, None
-    
+
     try:
         lib_path = _find_library_path('GL')
         return lib_path is not None, lib_path
@@ -130,7 +105,7 @@ def _get_platform_install_instructions() -> str:
     """Get platform-specific installation instructions for OpenGL support."""
     if sys.platform.startswith('linux'):
         in_docker = _is_docker()
-        
+
         base_instructions = """
 ==============================================================================
 OPENGL/EGL LIBRARIES NOT FOUND
@@ -216,10 +191,10 @@ def create_headless_context() -> moderngl.Context:
         RuntimeError: If no suitable backend is available.
     """
     errors = []
-    
+
     logger.info(f"Creating OpenGL context on platform: {sys.platform}")
     logger.info(f"Display available: {_check_display_available()}")
-    
+
     if sys.platform.startswith('linux'):
         egl_available, egl_path = _check_egl_available()
         gl_available, gl_path = _check_gl_available()
@@ -231,7 +206,7 @@ def create_headless_context() -> moderngl.Context:
         has_display = _check_display_available()
         egl_available, egl_path = _check_egl_available()
         gl_available, gl_path = _check_gl_available()
-        
+
         # Try EGL with detected library paths first
         if egl_available and egl_path:
             try:
@@ -247,7 +222,7 @@ def create_headless_context() -> moderngl.Context:
             except Exception as e:
                 errors.append(f"EGL (detected paths): {e}")
                 logger.warning(f"EGL backend with detected paths failed: {e}")
-        
+
         # Try EGL with default library names
         try:
             logger.info("Attempting EGL backend with default libraries...")
@@ -257,7 +232,7 @@ def create_headless_context() -> moderngl.Context:
         except Exception as e:
             errors.append(f"EGL (default): {e}")
             logger.warning(f"EGL backend with default libraries failed: {e}")
-        
+
         # Try EGL with common library paths
         egl_lib_variants = [
             'libEGL.so.1',
@@ -271,7 +246,7 @@ def create_headless_context() -> moderngl.Context:
             '/usr/lib/x86_64-linux-gnu/libGL.so.1',
             '/usr/lib64/libGL.so.1',
         ]
-        
+
         for egl_lib in egl_lib_variants:
             for gl_lib in gl_lib_variants:
                 try:
@@ -289,7 +264,7 @@ def create_headless_context() -> moderngl.Context:
                     if len(errors) < 3:
                         errors.append(f"EGL ({egl_lib}): {e}")
                     logger.debug(f"EGL with {egl_lib}, {gl_lib} failed: {e}")
-        
+
         # Try X11/GLX if display is available
         if has_display:
             try:
@@ -339,7 +314,7 @@ def create_headless_context() -> moderngl.Context:
     # All backends failed - provide helpful error message
     error_details = "; ".join(errors)
     install_instructions = _get_platform_install_instructions()
-    
+
     raise RuntimeError(
         f"Failed to create OpenGL context.\n\n"
         f"Attempted backends: {error_details}\n\n"
@@ -395,12 +370,25 @@ void main() {{
 
 
 class ShaderInjectorPipeline(Pipeline):
-    """Real-time shader injection pipeline using Shadertoy-style GLSL."""
+    """Real-time shader injection pipeline using Shadertoy-style GLSL.
+
+    This pipeline uses OpenGL (via ModernGL) for GPU-accelerated shader
+    rendering. Input video frames from Scope arrive as PyTorch tensors
+    (potentially on CUDA), are uploaded to OpenGL textures, processed by
+    a user-supplied fragment shader, and the result is read back and
+    returned as a PyTorch tensor.
+
+    GPU acceleration path:
+      CUDA tensor -> CPU (pinned memory) -> OpenGL texture -> shader render
+      -> framebuffer read -> CPU (pinned memory) -> CUDA tensor (async DMA)
+    """
 
     def __init__(
         self,
         height: int = 512,
         width: int = 512,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
         **kwargs,
     ):
         """Initialize the shader injector pipeline.
@@ -408,14 +396,27 @@ class ShaderInjectorPipeline(Pipeline):
         Args:
             height: Output frame height in pixels.
             width: Output frame width in pixels.
-            **kwargs: Additional arguments.
+            device: Target torch device (provided by Scope, e.g. cuda:0).
+            dtype: Target torch dtype (provided by Scope).
+            **kwargs: Additional arguments including shader_code, etc.
         """
         self.height = height
         self.width = width
-        
+        self.device = device if device is not None else torch.device(
+            'cuda' if torch.cuda.is_available() else 'cpu'
+        )
+        self.dtype = dtype if dtype is not None else torch.float32
+
         logger.info(f"Initializing ShaderInjectorPipeline: {width}x{height}")
-        logger.info(f"Init thread ID: {threading.get_ident()} (OpenGL will be initialized lazily)")
-        
+        logger.info(f"Target device: {self.device}, dtype: {self.dtype}")
+        logger.info(f"CUDA available: {torch.cuda.is_available()}")
+        if torch.cuda.is_available():
+            logger.info(f"CUDA device: {torch.cuda.get_device_name()}")
+        logger.info(
+            f"Init thread ID: {threading.get_ident()} "
+            f"(OpenGL will be initialized lazily in worker thread)"
+        )
+
         # Store configuration from kwargs (passed at pipeline load time)
         self.initial_shader_code = kwargs.get("shader_code", DEFAULT_SHADER)
         self.initial_reference_image = kwargs.get("reference_image", "")
@@ -423,9 +424,9 @@ class ShaderInjectorPipeline(Pipeline):
         self.initial_param1 = kwargs.get("param1", 0.5)
         self.initial_param2 = kwargs.get("param2", 0.5)
         self.initial_param3 = kwargs.get("param3", 0.5)
-        
+
         logger.info(f"Initial shader code length: {len(self.initial_shader_code)} chars")
-        
+
         # OpenGL resources - will be initialized lazily in the worker thread
         self._gl_initialized = False
         self._gl_thread_id = None
@@ -448,79 +449,106 @@ class ShaderInjectorPipeline(Pipeline):
         self.frame_count = 0
         self.start_time = time.time()
         self.last_frame_time = self.start_time
-        
-        # GPU Optimization: Texture pool for reuse (avoids per-frame allocation)
+
+        # Texture pool for reuse (avoids per-frame GPU memory allocation)
         self._texture_pool: dict[tuple[int, int], moderngl.Texture] = {}
         self._persistent_black_texture: moderngl.Texture | None = None
         self._persistent_test_pattern: moderngl.Texture | None = None
         self._test_pattern_size: tuple[int, int] | None = None
-        
-        # GPU Optimization: PBO buffers for async transfers
-        self._upload_pbo: moderngl.Buffer | None = None
-        self._download_pbo: moderngl.Buffer | None = None
-        self._pbo_size: int = 0
-        
-        # Track input tensor device for CUDA output optimization
-        self._input_device: torch.device | None = None
-        
-        # CUDA-GL interop state
-        self._cuda_gl_enabled = False
-        self._cuda_gl_checked = False
 
-    def _check_cuda_gl_interop(self) -> bool:
-        """Check if CUDA-GL interop can be used.
-        
-        This checks both library availability and runtime compatibility.
-        
-        Returns:
-            True if CUDA-GL interop is available and working.
+        # Pre-allocated transfer buffers (initialized on first frame)
+        # These eliminate per-frame memory allocation and enable pinned
+        # memory DMA for fast CPU<->GPU transfers.
+        self._buf_h: int = 0
+        self._buf_w: int = 0
+        self._upload_rgba: np.ndarray | None = None
+        self._output_pinned: torch.Tensor | None = None
+        self._output_np: np.ndarray | None = None
+
+    def _ensure_transfer_buffers(self, h: int, w: int):
+        """Ensure pre-allocated transfer buffers match frame dimensions.
+
+        Pre-allocating buffers eliminates per-frame memory allocation
+        overhead. Using pinned memory for the output tensor enables
+        async DMA transfers to the GPU.
+
+        Args:
+            h: Frame height.
+            w: Frame width.
         """
-        if self._cuda_gl_checked:
-            return self._cuda_gl_enabled
-        
-        self._cuda_gl_checked = True
-        
-        if not _CUDA_GL_AVAILABLE:
-            logger.info(f"CUDA-GL interop not available: {_cuda_gl_error}")
-            return False
-        
-        if not torch.cuda.is_available():
-            logger.info("CUDA-GL interop disabled: CUDA not available")
-            return False
-        
-        # Check if OpenGL context is compatible
-        try:
-            vendor = self.ctx.info.get('GL_VENDOR', '').lower()
-            if 'nvidia' not in vendor:
-                logger.info(f"CUDA-GL interop disabled: Non-NVIDIA GPU ({vendor})")
-                return False
-            
-            self._cuda_gl_enabled = True
-            logger.info("CUDA-GL interop enabled for zero-copy transfers")
-            return True
-            
-        except Exception as e:
-            logger.warning(f"CUDA-GL interop check failed: {e}")
-            return False
+        if self._buf_h == h and self._buf_w == w and self._upload_rgba is not None:
+            return
+
+        logger.info(f"Allocating transfer buffers for {w}x{h}")
+        self._buf_h = h
+        self._buf_w = w
+
+        # Upload buffer: RGBA uint8 for OpenGL texture writes
+        self._upload_rgba = np.empty((h, w, 4), dtype=np.uint8)
+
+        # Output buffer: pinned memory tensor for fast GPU DMA upload
+        use_pinned = self.device.type == 'cuda' and torch.cuda.is_available()
+        self._output_pinned = torch.empty(
+            h, w, 3, dtype=torch.float32,
+            pin_memory=use_pinned,
+        )
+        # Numpy view of the pinned tensor - writing here writes directly
+        # to pinned memory, enabling efficient DMA to GPU
+        self._output_np = self._output_pinned.numpy()
+
+        if use_pinned:
+            logger.info(
+                f"Using CUDA pinned memory for output transfer "
+                f"({h * w * 3 * 4 / 1024:.0f} KB)"
+            )
+        else:
+            logger.info("Using standard memory for output transfer (CPU mode)")
 
     def _initialize_gl(self):
         """Initialize OpenGL resources. Called lazily from the worker thread."""
         if self._gl_initialized:
             return
-        
+
         current_thread = threading.get_ident()
         logger.info(f"Initializing OpenGL in worker thread: {current_thread}")
-        
+
         # Create standalone OpenGL context (headless-compatible)
         self.ctx = create_headless_context()
         self._gl_thread_id = current_thread
-        
+
         # Log context info
+        gl_vendor = self.ctx.info.get('GL_VENDOR', 'Unknown')
+        gl_renderer = self.ctx.info.get('GL_RENDERER', 'Unknown')
         logger.info(f"OpenGL Version: {self.ctx.version_code}")
-        logger.info(f"OpenGL Vendor: {self.ctx.info.get('GL_VENDOR', 'Unknown')}")
-        logger.info(f"OpenGL Renderer: {self.ctx.info.get('GL_RENDERER', 'Unknown')}")
+        logger.info(f"OpenGL Vendor: {gl_vendor}")
+        logger.info(f"OpenGL Renderer: {gl_renderer}")
         logger.info(f"Max Texture Size: {self.ctx.info.get('GL_MAX_TEXTURE_SIZE', 'Unknown')}")
-        
+
+        # Detect software rendering - this is a common cause of "GPU not working"
+        software_renderers = [
+            'llvmpipe', 'softpipe', 'swrast', 'software',
+            'mesa x11', 'apple software renderer',
+        ]
+        renderer_lower = gl_renderer.lower()
+        if any(sw in renderer_lower for sw in software_renderers):
+            logger.warning(
+                "============================================================"
+            )
+            logger.warning(
+                f"SOFTWARE RENDERING DETECTED: {gl_renderer}"
+            )
+            logger.warning(
+                "Shaders will work but performance will be severely limited."
+            )
+            logger.warning(
+                "Install proper GPU drivers for hardware acceleration."
+            )
+            logger.warning(
+                "============================================================"
+            )
+        else:
+            logger.info(f"Hardware GPU rendering active: {gl_renderer}")
+
         # Test basic texture creation to verify context is working
         try:
             test_data = np.zeros((16, 16, 4), dtype=np.uint8)
@@ -544,12 +572,12 @@ class ShaderInjectorPipeline(Pipeline):
 
         # Mark as initialized BEFORE calling methods that might check this
         self._gl_initialized = True
-        
+
         # Compile the initial shader (from config, not default)
         logger.info(f"Compiling initial shader ({len(self.initial_shader_code)} chars)")
         self._compile_shader(self.initial_shader_code)
         self._setup_framebuffer()
-        
+
         logger.info("OpenGL initialization complete")
 
     @classmethod
@@ -559,58 +587,58 @@ class ShaderInjectorPipeline(Pipeline):
 
     def _preprocess_shader_code(self, shader_code: str) -> str:
         """Preprocess shader code to handle flattened single-line input.
-        
+
         When shader code is passed through certain interfaces, newlines may be
         removed, causing // comments to comment out the entire shader.
         This function attempts to restore proper line breaks.
-        
+
         Args:
             shader_code: Raw shader code, possibly flattened to single line.
-            
+
         Returns:
             Shader code with proper line breaks restored.
         """
         import re
-        
+
         # Step 0: Sanitize input - remove characters that GLSL doesn't support
         # This handles JSON escaping artifacts and copy-paste issues
-        
+
         # Remove any quote characters (GLSL doesn't support strings)
         if '"' in shader_code or "'" in shader_code:
             logger.warning("Removing quote characters from shader code (GLSL doesn't support strings)")
             shader_code = shader_code.replace('"', '').replace("'", '')
-        
+
         # Rename GLSL reserved words that are commonly used as variable names
         # 'char' is reserved in GLSL but people often use it for character-related code
         glsl_reserved_renames = {
             r'\bchar\b': 'charVar',      # char -> charVar
-            r'\bclass\b': 'classVar',    # class -> classVar  
+            r'\bclass\b': 'classVar',    # class -> classVar
             r'\btemplate\b': 'templateVar',  # template -> templateVar
         }
         for pattern, replacement in glsl_reserved_renames.items():
             if re.search(pattern, shader_code):
                 logger.warning(f"Renaming GLSL reserved word in shader code: {pattern} -> {replacement}")
                 shader_code = re.sub(pattern, replacement, shader_code)
-        
+
         # Remove common JSON escape sequences that might have leaked through
         shader_code = shader_code.replace('\\n', '\n')  # Convert literal \n to newline
         shader_code = shader_code.replace('\\t', ' ')   # Convert literal \t to space
         shader_code = shader_code.replace('\\/', '/')   # Unescape forward slash
-        
+
         # If the code already has proper newlines, return as-is
         if shader_code.count('\n') > 3:
             return shader_code
-        
+
         # If no mainImage, nothing to do
         if 'mainImage' not in shader_code:
             return shader_code
-        
+
         logger.info(f"Preprocessing shader code ({len(shader_code)} chars, {shader_code.count(chr(10))} newlines)")
-        
+
         # Step 1: Extract everything before 'void mainImage' as comments
         # and everything from 'void mainImage' onwards as the actual code
         main_idx = shader_code.find('void mainImage')
-        
+
         # Also check for truncated input like 'mainImage(' without 'void'
         if main_idx == -1:
             main_idx = shader_code.find('mainImage(')
@@ -619,32 +647,32 @@ class ShaderInjectorPipeline(Pipeline):
                 shader_code = shader_code[:main_idx] + 'void ' + shader_code[main_idx:]
                 main_idx = shader_code.find('void mainImage')
                 logger.warning("Shader was missing 'void' before mainImage, auto-fixed")
-        
+
         # Check for even more truncated input 'Image(' at the start
         if main_idx == -1:
             if shader_code.strip().startswith('Image('):
                 shader_code = 'void main' + shader_code.strip()
                 main_idx = 0
                 logger.warning("Shader was truncated to 'Image(', auto-fixed to 'void mainImage('")
-        
+
         if main_idx == -1:
             logger.warning("Could not find mainImage function in shader code")
             return shader_code
-        
+
         # Everything before mainImage - could be comments AND helper functions
         before_main = shader_code[:main_idx].strip()
         code_part = shader_code[main_idx:]
-        
+
         # Separate comments from helper functions in the before_main part
         # Helper functions contain patterns like "float funcname(" or "vec3 funcname("
         comments_part = ""
         helper_functions_part = ""
-        
+
         if before_main:
             # Find where actual code (helper functions) starts
             # Look for function definitions: type name(
             func_match = re.search(r'(float|int|vec[234]|mat[234]|void|bool)\s+[a-zA-Z_][a-zA-Z0-9_]*\s*\(', before_main)
-            
+
             if func_match:
                 # There are helper functions - split comments from functions
                 func_start = func_match.start()
@@ -654,11 +682,11 @@ class ShaderInjectorPipeline(Pipeline):
             else:
                 # No helper functions, everything is comments
                 comments_part = before_main
-        
+
         # Step 2: Format the code part properly
         # Replace multiple spaces with single space first
         code_part = re.sub(r'  +', ' ', code_part)
-        
+
         # Add newlines at key positions
         # After opening brace
         code_part = re.sub(r'\{\s*', '{\n    ', code_part)
@@ -666,7 +694,7 @@ class ShaderInjectorPipeline(Pipeline):
         code_part = re.sub(r'\s*\}', '\n}', code_part)
         # After semicolons followed by code OR comments
         code_part = re.sub(r';\s*(?=[a-zA-Z/])', ';\n    ', code_part)
-        
+
         # Step 3: Handle any // comments within the code
         # They need to end at the next statement
         lines = code_part.split('\n')
@@ -678,13 +706,13 @@ class ShaderInjectorPipeline(Pipeline):
                 comment_idx = line.find('//')
                 before_comment = line[:comment_idx].strip()
                 after_comment = line[comment_idx:]
-                
+
                 # Check if the comment has code after it (after the comment text)
                 # Pattern: // some text followed by a type keyword starting a statement
                 # Match common GLSL types (must be followed by identifier or opening paren)
                 # Note: Use .*? instead of [^/]*? because comments may contain / (e.g., "barrel/pincushion")
                 match = re.search(
-                    r'//.*?\s+(void\s+\w|vec[234]\s+\w|mat[234]\s+\w|float\s+\w|int\s+\w|bool\s+\w|fragColor\s*=|return\s)', 
+                    r'//.*?\s+(void\s+\w|vec[234]\s+\w|mat[234]\s+\w|float\s+\w|int\s+\w|bool\s+\w|fragColor\s*=|return\s)',
                     after_comment
                 )
                 # Control flow (if, for, while followed by (, or else)
@@ -693,7 +721,7 @@ class ShaderInjectorPipeline(Pipeline):
                 # Variable assignments including compound assignments (+=, -=, *=, /=)
                 if not match:
                     match = re.search(r'//.*?\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*[+\-*/]?=', after_comment)
-                
+
                 if match:
                     # Split the comment from the code
                     split_pos = match.start(1)
@@ -708,10 +736,10 @@ class ShaderInjectorPipeline(Pipeline):
             else:
                 if line:
                     fixed_lines.append(line)
-        
+
         # Step 4: Combine comments, helper functions, and formatted main code
         result_lines = []
-        
+
         # Add comments first
         if comments_part:
             # Split comments by // to put each on its own line
@@ -725,7 +753,7 @@ class ShaderInjectorPipeline(Pipeline):
                         # First part might not have // prefix if it's leading text
                         if comment_parts[0].strip():
                             result_lines.append(part)
-        
+
         # Add helper functions (need formatting too)
         if helper_functions_part:
             # Format helper functions similar to main code
@@ -734,29 +762,29 @@ class ShaderInjectorPipeline(Pipeline):
             helpers = re.sub(r'\{\s*', '{\n    ', helpers)
             helpers = re.sub(r'\s*\}', '\n}', helpers)
             helpers = re.sub(r';\s*(?=[a-zA-Z/])', ';\n    ', helpers)
-            
+
             # Apply the same inline comment handling as main code
             helper_lines = helpers.split('\n')
             for line in helper_lines:
                 line = line.strip()
                 if not line:
                     continue
-                    
+
                 if '//' in line:
                     comment_idx = line.find('//')
                     before_comment = line[:comment_idx].strip()
                     after_comment = line[comment_idx:]
-                    
+
                     # Check for code after comment
                     match = re.search(
-                        r'//.*?\s+(void\s+\w|vec[234]\s+\w|mat[234]\s+\w|float\s+\w|int\s+\w|bool\s+\w|return\s)', 
+                        r'//.*?\s+(void\s+\w|vec[234]\s+\w|mat[234]\s+\w|float\s+\w|int\s+\w|bool\s+\w|return\s)',
                         after_comment
                     )
                     if not match:
                         match = re.search(r'//.*?\s+(if\s*\(|for\s*\(|while\s*\(|else\s)', after_comment)
                     if not match:
                         match = re.search(r'//.*?\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*[+\-*/]?=', after_comment)
-                    
+
                     if match:
                         split_pos = match.start(1)
                         comment_text = after_comment[:split_pos].rstrip()
@@ -769,18 +797,18 @@ class ShaderInjectorPipeline(Pipeline):
                         result_lines.append(line)
                 else:
                     result_lines.append(line)
-            
+
             # Add blank line before mainImage
             result_lines.append('')
-        
+
         # Add the main function code
         result_lines.extend(fixed_lines)
-        
+
         result = '\n'.join(result_lines)
-        
+
         # Clean up any double newlines
         result = re.sub(r'\n\s*\n', '\n', result)
-        
+
         logger.info(f"Preprocessed shader:\n{result}")
         return result
 
@@ -808,7 +836,7 @@ class ShaderInjectorPipeline(Pipeline):
 
         # Build full fragment shader
         fragment_shader = FRAGMENT_SHADER_TEMPLATE.format(user_code=shader_code)
-        
+
         # Log the shader being compiled for debugging
         logger.debug(f"Compiling fragment shader:\n{fragment_shader[:500]}...")
 
@@ -848,7 +876,7 @@ class ShaderInjectorPipeline(Pipeline):
 
         except Exception as e:
             logger.error(f"Shader compilation error: {e}")
-            
+
             # Keep the old working program if we have one
             if old_program is not None:
                 logger.info("Keeping previous working shader")
@@ -856,19 +884,19 @@ class ShaderInjectorPipeline(Pipeline):
                 self.vao = old_vao
                 self.current_shader_code = old_shader_code
                 return False
-            
+
             # No previous shader, try default
             if shader_code != DEFAULT_SHADER:
                 logger.info("Falling back to default shader")
                 return self._compile_shader(DEFAULT_SHADER)
-            
+
             # Even default shader failed - this is a serious error
             logger.error("Default shader compilation failed - OpenGL context may be broken")
             return False
 
     def _ensure_context_active(self):
         """Ensure the OpenGL context is active/current.
-        
+
         For standalone contexts, this makes the context current for the calling thread.
         This also initializes OpenGL if not yet done (lazy initialization).
         """
@@ -876,13 +904,13 @@ class ShaderInjectorPipeline(Pipeline):
         if not self._gl_initialized:
             self._initialize_gl()
             return  # Context is already current after initialization
-        
+
         # Check if we're in the same thread
         current_thread = threading.get_ident()
         if self._gl_thread_id and current_thread != self._gl_thread_id:
             logger.error(f"OpenGL context used from wrong thread! GL thread: {self._gl_thread_id}, Current: {current_thread}")
             raise RuntimeError("OpenGL context cannot be used from a different thread")
-        
+
         try:
             # For standalone contexts, we need to make sure it's current
             if hasattr(self.ctx, 'mglo') and hasattr(self.ctx.mglo, 'make_current'):
@@ -901,18 +929,18 @@ class ShaderInjectorPipeline(Pipeline):
             self.fbo.release()
 
         logger.info(f"Setting up framebuffer: {self.width}x{self.height}")
-        
+
         # Ensure context is active
         self._ensure_context_active()
-        
+
         try:
             self.output_texture = self.ctx.texture((self.width, self.height), 4)
             self.fbo = self.ctx.framebuffer(color_attachments=[self.output_texture])
-            logger.info(f"Framebuffer created successfully")
+            logger.info("Framebuffer created successfully")
         except Exception as e:
             logger.error(f"Failed to create framebuffer: {e}")
             raise
-        
+
         # Test that we can use the framebuffer
         try:
             self.fbo.use()
@@ -924,14 +952,14 @@ class ShaderInjectorPipeline(Pipeline):
 
     def _get_or_create_texture(self, width: int, height: int) -> moderngl.Texture:
         """Get a texture from the pool or create a new one.
-        
-        GPU Optimization: Reuses textures instead of creating new ones each frame.
-        This eliminates texture allocation overhead which is significant.
-        
+
+        Reuses textures of matching size to avoid per-frame GPU memory
+        allocation, which is a significant overhead at high frame rates.
+
         Args:
             width: Texture width.
             height: Texture height.
-            
+
         Returns:
             ModernGL texture (may contain old data, caller must write new data).
         """
@@ -944,267 +972,86 @@ class ShaderInjectorPipeline(Pipeline):
             texture.repeat_y = False
             self._texture_pool[key] = texture
         return self._texture_pool[key]
-    
-    def _get_upload_pbo(self, size: int) -> moderngl.Buffer:
-        """Get or create a PBO buffer for texture uploads.
-        
-        GPU Optimization: PBOs enable DMA transfers that don't block the CPU.
-        The buffer is reused across frames to avoid allocation overhead.
-        
-        Args:
-            size: Required buffer size in bytes.
-            
-        Returns:
-            ModernGL buffer suitable for texture upload.
-        """
-        if self._upload_pbo is None or self._pbo_size < size:
-            if self._upload_pbo is not None:
-                self._upload_pbo.release()
-            
-            # Allocate with some headroom to avoid frequent reallocations
-            alloc_size = max(size, self.width * self.height * 4)
-            logger.debug(f"Creating upload PBO: {alloc_size} bytes")
-            
-            # Use dynamic=True for frequently updated buffers
-            self._upload_pbo = self.ctx.buffer(reserve=alloc_size, dynamic=True)
-            self._pbo_size = alloc_size
-        
-        return self._upload_pbo
-    
-    def _upload_texture_via_pbo(self, texture: moderngl.Texture, data: bytes, width: int, height: int):
-        """Upload texture data using a PBO for better performance.
-        
-        GPU Optimization: Using a PBO allows the GPU to perform DMA transfers
-        asynchronously, reducing CPU stalls during texture uploads.
-        
-        Args:
-            texture: Target texture.
-            data: Raw pixel data (RGBA, uint8).
-            width: Texture width.
-            height: Texture height.
-        """
-        size = len(data)
-        pbo = self._get_upload_pbo(size)
-        
-        # Write data to PBO (this can be done while GPU is busy)
-        pbo.write(data)
-        
-        # Copy from PBO to texture (GPU handles this efficiently)
-        texture.write(pbo)
-    
-    def _get_download_pbo(self, size: int) -> moderngl.Buffer:
-        """Get or create a PBO buffer for framebuffer readback.
-        
-        GPU Optimization: PBOs enable async readback that doesn't block rendering.
-        
-        Args:
-            size: Required buffer size in bytes.
-            
-        Returns:
-            ModernGL buffer suitable for framebuffer readback.
-        """
-        if self._download_pbo is None or self._download_pbo.size < size:
-            if self._download_pbo is not None:
-                self._download_pbo.release()
-            
-            logger.debug(f"Creating download PBO: {size} bytes")
-            # Reserve buffer for readback
-            self._download_pbo = self.ctx.buffer(reserve=size)
-        
-        return self._download_pbo
-    
-    def _read_framebuffer_via_pbo(self) -> bytes:
-        """Read framebuffer data using a PBO for better performance.
-        
-        GPU Optimization: Using a PBO for readback allows the GPU to transfer
-        data asynchronously, reducing CPU stalls.
-        
-        Returns:
-            Raw pixel data (RGBA, uint8).
-        """
-        size = self.width * self.height * 4
-        pbo = self._get_download_pbo(size)
-        
-        # Read framebuffer into PBO (GPU initiates DMA transfer)
-        self.fbo.read_into(pbo, components=4)
-        
-        # Read from PBO to CPU (may still block, but transfer is optimized)
-        return pbo.read()
-    
-    def _try_cuda_tensor_upload(self, tensor: torch.Tensor, texture: moderngl.Texture) -> bool:
-        """Try to upload tensor data using CUDA-GL interop (zero-copy).
-        
-        GPU Optimization: When available, this enables direct GPU-to-GPU transfer
-        without any CPU involvement, providing maximum performance.
-        
-        Args:
-            tensor: CUDA tensor to upload.
-            texture: Target OpenGL texture.
-            
-        Returns:
-            True if CUDA-GL upload succeeded, False to fall back to PBO.
-        """
-        if not self._check_cuda_gl_interop():
-            return False
-        
-        if not tensor.is_cuda:
-            return False
-        
-        try:
-            # This is a placeholder for full CUDA-GL interop implementation
-            # Full implementation requires:
-            # 1. Register OpenGL texture with CUDA (cudaGraphicsGLRegisterImage)
-            # 2. Map the resource (cudaGraphicsMapResources)
-            # 3. Get CUDA array from mapped resource
-            # 4. Copy from CUDA tensor to CUDA array (cudaMemcpy2DToArray)
-            # 5. Unmap resource (cudaGraphicsUnmapResources)
-            #
-            # For now, we use an optimized path that minimizes copies:
-            # - Keep tensor on GPU as long as possible
-            # - Use pinned memory for the CPU transfer
-            
-            if _CUDA_GL_AVAILABLE and _CUDA_GL_BACKEND == "cupy":
-                # CuPy path: Use pinned memory for faster transfer
-                # This is still faster than regular numpy conversion
-                with cp.cuda.Stream() as stream:
-                    # Convert torch tensor to cupy array (zero-copy on same device)
-                    if tensor.dim() == 4:
-                        tensor = tensor.squeeze(0)
-                    
-                    # Ensure contiguous
-                    tensor = tensor.contiguous()
-                    
-                    # Get data pointer and create cupy array view
-                    # Note: This shares memory with the torch tensor
-                    cp_array = cp.asarray(tensor)
-                    
-                    # Process on GPU: normalize, convert to uint8, add alpha
-                    h, w = cp_array.shape[:2]
-                    c = cp_array.shape[2] if cp_array.ndim > 2 else 1
-                    
-                    # Normalize to [0, 255]
-                    if cp_array.max() <= 1.0:
-                        cp_array = cp_array * 255.0
-                    
-                    cp_array = cp.clip(cp_array, 0, 255).astype(cp.uint8)
-                    
-                    # Convert to RGBA
-                    if c == 3:
-                        rgba = cp.zeros((h, w, 4), dtype=cp.uint8)
-                        rgba[:, :, :3] = cp_array
-                        rgba[:, :, 3] = 255
-                        cp_array = rgba
-                    elif c == 1:
-                        rgba = cp.zeros((h, w, 4), dtype=cp.uint8)
-                        rgba[:, :, 0] = cp_array[:, :, 0] if cp_array.ndim > 2 else cp_array
-                        rgba[:, :, 1] = rgba[:, :, 0]
-                        rgba[:, :, 2] = rgba[:, :, 0]
-                        rgba[:, :, 3] = 255
-                        cp_array = rgba
-                    
-                    # Flip for OpenGL
-                    cp_array = cp.flipud(cp_array)
-                    
-                    # Sync and get bytes (this is the only CPU transfer)
-                    stream.synchronize()
-                    data_bytes = cp.asnumpy(cp_array).tobytes()
-                    
-                    # Upload via PBO (already optimized)
-                    self._upload_texture_via_pbo(texture, data_bytes, w, h)
-                    
-                    return True
-            
-            return False
-            
-        except Exception as e:
-            logger.debug(f"CUDA-GL interop upload failed, falling back to PBO: {e}")
-            return False
-    
-    def _prepare_tensor_data(self, tensor: torch.Tensor) -> tuple[np.ndarray, int, int]:
-        """Prepare tensor data for GPU upload.
-        
-        Converts PyTorch tensor to numpy array in RGBA uint8 format.
-        
+
+    def _prepare_tensor_data(self, tensor: torch.Tensor) -> tuple[bytes, int, int]:
+        """Prepare tensor data for OpenGL texture upload.
+
+        Converts a PyTorch tensor to RGBA uint8 bytes suitable for
+        writing directly to a ModernGL texture. Uses a pre-allocated
+        RGBA buffer to minimize per-frame memory allocation.
+
         Args:
             tensor: Input tensor of shape (1, H, W, C) or (H, W, C).
-            
+                    Values in [0, 255] uint8 (from Scope) or [0, 1] float.
+
         Returns:
-            Tuple of (data array, width, height).
+            Tuple of (data_bytes, width, height).
         """
-        # Track input device for potential CUDA output optimization
-        self._input_device = tensor.device
-        
-        # Handle different tensor shapes
+        # Handle batch dimension
         if tensor.dim() == 4:
             tensor = tensor.squeeze(0)
-        
-        # Log tensor info for debugging
-        logger.debug(f"Input tensor shape: {tensor.shape}, dtype: {tensor.dtype}, "
-                     f"device: {tensor.device}")
 
-        # Convert to numpy (this is the CPU transfer - unavoidable without CUDA-GL interop)
+        h, w = tensor.shape[0], tensor.shape[1]
+        c = tensor.shape[2] if tensor.dim() > 2 else 1
+
+        logger.debug(
+            f"Input tensor: shape={tensor.shape}, dtype={tensor.dtype}, "
+            f"device={tensor.device}"
+        )
+
+        # Ensure transfer buffers are allocated for this resolution
+        self._ensure_transfer_buffers(h, w)
+
+        # Move to CPU - this is the main transfer cost and is unavoidable
+        # without full CUDA-GL interop (which requires native CUDA bindings)
         data = tensor.cpu().numpy()
-        
-        # Handle different shapes
+
+        # Handle different data types and ranges
         if data.ndim == 2:
             # Grayscale - expand to RGB
             h, w = data.shape
             c = 1
             data = np.stack([data, data, data], axis=-1)
-        else:
-            h, w, c = data.shape
-        
-        # Normalize to [0, 255] range if needed
-        if data.max() <= 1.0 and data.min() >= 0.0:
-            # Data is in [0, 1] range
-            data = (data * 255.0)
-        elif data.max() <= 1.0 and data.min() >= -1.0:
-            # Data might be in [-1, 1] range
-            data = ((data + 1.0) * 127.5)
-        
-        # Convert to uint8
-        data = np.clip(data, 0, 255).astype(np.uint8)
 
-        # Ensure RGBA format (4 channels)
-        if c == 1 or data.shape[-1] == 1:
-            # Grayscale to RGBA
-            if data.ndim == 2:
-                rgba = np.zeros((h, w, 4), dtype=np.uint8)
-                rgba[:, :, 0] = data
-                rgba[:, :, 1] = data
-                rgba[:, :, 2] = data
-                rgba[:, :, 3] = 255
-            else:
-                gray = data[:, :, 0]
-                rgba = np.zeros((h, w, 4), dtype=np.uint8)
-                rgba[:, :, 0] = gray
-                rgba[:, :, 1] = gray
-                rgba[:, :, 2] = gray
-                rgba[:, :, 3] = 255
-            data = rgba
+        # Normalize to [0, 255] if not already uint8
+        if data.dtype != np.uint8:
+            if data.max() <= 1.0 and data.min() >= 0.0:
+                data = data * 255.0
+            elif data.max() <= 1.0 and data.min() >= -1.0:
+                data = (data + 1.0) * 127.5
+            data = np.clip(data, 0, 255).astype(np.uint8)
+
+        # Write RGBA into pre-allocated buffer (avoids per-frame allocation)
+        rgba = self._upload_rgba
+        actual_channels = data.shape[-1] if data.ndim > 2 else 1
+
+        if actual_channels == 1 or (data.ndim > 2 and data.shape[-1] == 1):
+            gray = data if data.ndim == 2 else data[:, :, 0]
+            rgba[:, :, 0] = gray
+            rgba[:, :, 1] = gray
+            rgba[:, :, 2] = gray
+            rgba[:, :, 3] = 255
         elif data.shape[-1] == 3:
-            # RGB to RGBA
-            rgba = np.zeros((h, w, 4), dtype=np.uint8)
             rgba[:, :, :3] = data
             rgba[:, :, 3] = 255
-            data = rgba
-        elif data.shape[-1] != 4:
+        elif data.shape[-1] == 4:
+            np.copyto(rgba, data)
+        else:
             raise ValueError(f"Unsupported number of channels: {data.shape[-1]}")
 
         # Flip vertically for OpenGL (origin at bottom-left)
-        data = np.flipud(data)
-        
-        # Ensure contiguous C-order array
-        data = np.ascontiguousarray(data, dtype=np.uint8)
-        
-        return data, w, h
+        # and ensure contiguous memory layout for texture upload
+        flipped = np.ascontiguousarray(rgba[::-1])
 
-    def _create_texture_from_tensor(self, tensor: torch.Tensor) -> tuple[moderngl.Texture, bool]:
+        return flipped.tobytes(), w, h
+
+    def _create_texture_from_tensor(
+        self, tensor: torch.Tensor
+    ) -> tuple[moderngl.Texture, bool]:
         """Create or update a ModernGL texture from a PyTorch tensor.
 
-        GPU Optimization: Uses texture pooling to avoid per-frame allocation.
-        Tries CUDA-GL interop first for zero-copy, falls back to PBO.
-        Returns a tuple indicating if the texture is from the pool (should not be released).
+        Uses texture pooling to avoid per-frame GPU memory allocation.
+        Writes texture data directly (no intermediate buffers).
 
         Args:
             tensor: Input tensor of shape (1, H, W, C) or (H, W, C).
@@ -1216,10 +1063,7 @@ class ShaderInjectorPipeline(Pipeline):
         """
         # Ensure context is active before GPU operations
         self._ensure_context_active()
-        
-        # Track input device for CUDA output optimization
-        self._input_device = tensor.device
-        
+
         # Get dimensions for texture pool lookup
         if tensor.dim() == 4:
             _, h, w, c = tensor.shape
@@ -1228,37 +1072,21 @@ class ShaderInjectorPipeline(Pipeline):
         else:
             h, w = tensor.shape
             c = 1
-        
+
         # Validate dimensions
         if w <= 0 or h <= 0:
             raise ValueError(f"Invalid texture dimensions: {w}x{h}")
-        
+
         try:
-            # GPU Optimization: Reuse texture from pool
+            # Reuse texture from pool (avoids GPU memory allocation)
             texture = self._get_or_create_texture(w, h)
-            
-            # GPU Optimization: Try CUDA-GL interop first (zero-copy)
-            if tensor.is_cuda and self._try_cuda_tensor_upload(tensor, texture):
-                logger.debug(f"Used CUDA-GL interop for texture upload: {w}x{h}")
-                return texture, True
-            
-            # Fall back to PBO-based upload
-            data, w, h = self._prepare_tensor_data(tensor)
-            
-            # Validate data size
-            expected_size = w * h * 4
-            actual_size = data.nbytes
-            if actual_size != expected_size:
-                raise ValueError(f"Data size mismatch: expected {expected_size}, got {actual_size}")
-            
-            logger.debug(f"Updating texture via PBO: {w}x{h}, data size: {actual_size}")
-            
-            # GPU Optimization: Use PBO for async upload
-            data_bytes = data.tobytes()
-            self._upload_texture_via_pbo(texture, data_bytes, w, h)
-            
+
+            # Prepare data and write directly to texture
+            data_bytes, w, h = self._prepare_tensor_data(tensor)
+            texture.write(data_bytes)
+
             return texture, True  # True = pooled, don't release
-            
+
         except Exception as e:
             logger.error(f"Failed to update texture: {e}")
             logger.error(f"Texture params: size=({w}, {h}), components=4")
@@ -1280,7 +1108,7 @@ class ShaderInjectorPipeline(Pipeline):
         try:
             # Ensure context is active
             self._ensure_context_active()
-            
+
             img = Image.open(path).convert('RGBA')
             img = img.resize((self.width, self.height), Image.Resampling.LANCZOS)
             data = np.array(img, dtype=np.uint8)
@@ -1295,13 +1123,10 @@ class ShaderInjectorPipeline(Pipeline):
             return None
 
     def _get_black_texture(self) -> moderngl.Texture:
-        """Get or create a persistent black texture for unused channels.
-        
-        GPU Optimization: Reuses a single black texture instead of creating per frame.
-        """
+        """Get or create a persistent black texture for unused channels."""
         # Ensure context is active
         self._ensure_context_active()
-        
+
         # Check if we need to create or recreate the texture
         if self._persistent_black_texture is None:
             logger.debug(f"Creating persistent black texture: {self.width}x{self.height}")
@@ -1313,29 +1138,26 @@ class ShaderInjectorPipeline(Pipeline):
                 (self.width, self.height), 4, data.tobytes()
             )
             self._persistent_black_texture.filter = (moderngl.LINEAR, moderngl.LINEAR)
-        
+
         return self._persistent_black_texture
 
     def _get_test_pattern(self) -> moderngl.Texture:
-        """Get or create a persistent test pattern texture for text mode.
-        
-        GPU Optimization: Reuses test pattern texture instead of creating per frame.
-        """
+        """Get or create a persistent test pattern texture for text mode."""
         # Ensure context is active
         self._ensure_context_active()
-        
+
         current_size = (self.width, self.height)
-        
+
         # Check if we need to create or recreate the texture
-        if (self._persistent_test_pattern is None or 
-            self._test_pattern_size != current_size):
-            
+        if (self._persistent_test_pattern is None or
+                self._test_pattern_size != current_size):
+
             logger.debug(f"Creating persistent test pattern: {self.width}x{self.height}")
-            
+
             # Release old texture if size changed
             if self._persistent_test_pattern is not None:
                 self._persistent_test_pattern.release()
-            
+
             # Create a colorful gradient pattern
             y, x = np.mgrid[0:self.height, 0:self.width]
             r = ((x / self.width) * 255).astype(np.uint8)
@@ -1345,13 +1167,13 @@ class ShaderInjectorPipeline(Pipeline):
 
             data = np.stack([r, g, b, a], axis=-1)
             data = np.ascontiguousarray(data)
-            
+
             self._persistent_test_pattern = self.ctx.texture(
                 (self.width, self.height), 4, data.tobytes()
             )
             self._persistent_test_pattern.filter = (moderngl.LINEAR, moderngl.LINEAR)
             self._test_pattern_size = current_size
-        
+
         return self._persistent_test_pattern
 
     def prepare(self, **kwargs) -> Requirements | None:
@@ -1383,18 +1205,19 @@ class ShaderInjectorPipeline(Pipeline):
                 - prompt: Alternative source for shader code
 
         Returns:
-            Dict with "video" key containing processed frames tensor.
+            Dict with "video" key containing processed frames tensor
+            on self.device, shape (1, H, W, 3), values in [0, 1].
         """
         # Ensure OpenGL context is active for this thread
         self._ensure_context_active()
-        
+
         # Get shader code - prefer runtime kwargs, fall back to initial config
         shader_code = kwargs.get("shader_code", kwargs.get("prompt", None))
-        
+
         # If no runtime shader code provided, use the initial configuration
         if shader_code is None or shader_code.strip() == "":
             shader_code = self.initial_shader_code
-        
+
         # Validate shader code - if clearly not GLSL, use initial shader
         if "mainImage" not in shader_code:
             # Check if it looks like natural language (no GLSL keywords)
@@ -1408,7 +1231,7 @@ class ShaderInjectorPipeline(Pipeline):
 
         # Compile shader if changed
         compile_success = self._compile_shader(shader_code)
-        
+
         # Ensure we have a working program - critical for rendering
         if self.program is None:
             logger.error("No working shader program available")
@@ -1435,29 +1258,31 @@ class ShaderInjectorPipeline(Pipeline):
             self.reference_image_path = reference_image
 
         # Get video input or create test pattern
-        # GPU Optimization: Track if texture is pooled (should not be released)
-        input_texture_pooled = False
         video = kwargs.get("video")
         if video is not None and len(video) > 0:
             # Video mode - use input frame
             frame = video[0]
-            logger.debug(f"Processing video frame: type={type(frame)}, shape={frame.shape if hasattr(frame, 'shape') else 'N/A'}")
+            logger.debug(
+                f"Processing video frame: type={type(frame)}, "
+                f"shape={frame.shape if hasattr(frame, 'shape') else 'N/A'}"
+            )
             try:
-                input_texture, input_texture_pooled = self._create_texture_from_tensor(frame)
+                input_texture, _ = self._create_texture_from_tensor(frame)
             except Exception as e:
                 logger.error(f"Failed to create texture from video frame: {e}")
-                logger.error(f"Frame info: type={type(frame)}, shape={frame.shape if hasattr(frame, 'shape') else 'N/A'}, "
-                            f"dtype={frame.dtype if hasattr(frame, 'dtype') else 'N/A'}")
-                # Fall back to test pattern (persistent, don't release)
+                logger.error(
+                    f"Frame info: type={type(frame)}, "
+                    f"shape={frame.shape if hasattr(frame, 'shape') else 'N/A'}, "
+                    f"dtype={frame.dtype if hasattr(frame, 'dtype') else 'N/A'}"
+                )
+                # Fall back to test pattern
                 logger.warning("Falling back to test pattern due to texture creation failure")
                 input_texture = self._get_test_pattern()
-                input_texture_pooled = True
         else:
             # Text mode - use persistent test pattern
             input_texture = self._get_test_pattern()
-            input_texture_pooled = True
 
-        # GPU Optimization: Use persistent black texture (don't release)
+        # Persistent black texture for unused channels
         black_texture = self._get_black_texture()
         ref_texture = self.reference_texture if self.reference_texture else black_texture
 
@@ -1538,35 +1363,50 @@ class ShaderInjectorPipeline(Pipeline):
         else:
             logger.error("VAO is None - cannot render!")
 
-        # GPU Optimization: Read back result using PBO for async transfer
-        data = self._read_framebuffer_via_pbo()
-        result = np.frombuffer(data, dtype=np.uint8).reshape(self.height, self.width, 4)
+        # --- Read back result ---
+        # Read framebuffer directly (no intermediate buffer copies)
+        raw = self.fbo.read(components=4)
+        result = np.frombuffer(raw, dtype=np.uint8).reshape(
+            self.height, self.width, 4
+        )
 
-        # Convert to RGB and normalize to [0, 1]
-        result_rgb = result[:, :, :3].astype(np.float32) / 255.0
+        # Ensure output transfer buffers exist
+        self._ensure_transfer_buffers(self.height, self.width)
 
-        # Flip vertically (OpenGL has origin at bottom-left)
-        result_rgb = np.flip(result_rgb, axis=0).copy()
+        # Flip Y (OpenGL origin is bottom-left) + extract RGB + normalize
+        # to [0, 1] range, writing directly into pinned memory buffer.
+        # result[::-1, :, :3] is a zero-copy reversed+sliced view.
+        # The assignment into _output_np (backed by pinned memory)
+        # handles the uint8->float32 cast and copies into DMA-ready memory.
+        self._output_np[:] = result[::-1, :, :3]
+        self._output_np *= (1.0 / 255.0)
 
-        # Convert to tensor with shape (1, H, W, 3)
-        output = torch.from_numpy(result_rgb).unsqueeze(0)
-        
-        # GPU Optimization: If input was on CUDA, move output to CUDA
-        # This allows downstream operations to stay on GPU
-        if self._input_device is not None and self._input_device.type == 'cuda':
-            output = output.to(self._input_device)
+        # Transfer to target device
+        if self.device.type == 'cuda':
+            # Async DMA from pinned memory to GPU - this is significantly
+            # faster than regular .to(device) because:
+            # 1. Pinned memory enables DMA (Direct Memory Access)
+            # 2. non_blocking=True allows CPU to continue while GPU copies
+            # The CUDA stream serializes operations, so downstream GPU ops
+            # (like Scope's output * 255.0) will wait for the DMA to finish.
+            output = self._output_pinned.to(
+                self.device, non_blocking=True
+            ).unsqueeze(0)
+        else:
+            # CPU path - clone to avoid aliasing the pre-allocated buffer
+            output = self._output_pinned.clone().unsqueeze(0)
 
         # Log every 100 frames to show we're processing
         if self.frame_count % 100 == 0:
             # Sample center pixel to verify rendering
             center_y, center_x = self.height // 2, self.width // 2
-            center_pixel = result_rgb[center_y, center_x]
-            logger.info(f"Frame {self.frame_count}: output shape={output.shape}, "
-                       f"center_pixel={center_pixel}, shader={self.current_shader_code[:50] if self.current_shader_code else 'None'}...")
-
-        # GPU Optimization: Don't release pooled/persistent textures
-        # They will be reused in the next frame
-        # (input_texture_pooled and black_texture are persistent)
+            center_val = self._output_np[center_y, center_x]
+            logger.info(
+                f"Frame {self.frame_count}: output shape={output.shape}, "
+                f"device={output.device}, center_pixel=[{center_val[0]:.3f}, "
+                f"{center_val[1]:.3f}, {center_val[2]:.3f}], "
+                f"shader={self.current_shader_code[:50] if self.current_shader_code else 'None'}..."
+            )
 
         # Increment frame counter
         self.frame_count += 1
@@ -1581,19 +1421,13 @@ class ShaderInjectorPipeline(Pipeline):
                 for tex in self._texture_pool.values():
                     if tex is not None:
                         tex.release()
-            
+
             # Clean up persistent textures
             if hasattr(self, '_persistent_black_texture') and self._persistent_black_texture is not None:
                 self._persistent_black_texture.release()
             if hasattr(self, '_persistent_test_pattern') and self._persistent_test_pattern is not None:
                 self._persistent_test_pattern.release()
-            
-            # Clean up PBO buffers
-            if hasattr(self, '_upload_pbo') and self._upload_pbo is not None:
-                self._upload_pbo.release()
-            if hasattr(self, '_download_pbo') and self._download_pbo is not None:
-                self._download_pbo.release()
-            
+
             # Clean up channel textures
             if hasattr(self, 'channel_textures'):
                 for tex in self.channel_textures:
